@@ -157,7 +157,7 @@ def main():
     # ── 7. Serialization round-trip ───────────────────────────────
     print("\n=== Serialization ===")
     import tempfile, os
-    tmp = tempfile.mktemp(suffix=".json")
+    tmp = tempfile.mkstemp(suffix=".json")
     g.save(tmp)
     g2 = DepGraph.load(tmp)
     os.remove(tmp)

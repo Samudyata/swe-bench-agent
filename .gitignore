@@ -3,3 +3,6 @@ graphs/
 __pycache__/
 *.pyc
 .env
+.DS_Store
+example_trace.py
+example_outputs/
