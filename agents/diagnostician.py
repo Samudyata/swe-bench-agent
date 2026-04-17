@@ -1,340 +1,318 @@
-"""Diagnostician agent — reads localised context and produces a structured fix plan.
+"""
+diagnostician.py — Diagnostician Agent (Agent 3)
 
-Implements the interface defined in agents/stubs.py:
+Reads the localized source files + issue description from the Localizer,
+reasons about the root cause, and produces a structured FixPlan for the Patcher.
 
-    diagnose(instance, bundle)         → FixPlan   (first attempt)
-    revise(instance, bundle, feedback) → FixPlan   (retry after test/apply failure)
+Inputs  (from Person 3 / Localizer):  ContextBundle
+Outputs (to   Person 4 / Patcher):    FixPlan
 
-The agent sends the issue description + real source file contents to an LLM and
-parses the JSON response into a typed FixPlan.  Real file content comes from the
-ContextBundle that Person 3's Localizer already populated, so the LLM reasons
-over actual code, not hallucinated reconstructions.
-
-Usage
------
-    from agents.diagnostician import DiagnosticianAgent
-    agent = DiagnosticianAgent()
-    fix_plan = agent.diagnose(instance, bundle)
-
-    # On test-failure feedback from Validator (Loop C):
-    revised  = agent.revise(instance, bundle, feedback)
+Retry handling:
+  - If Person 5 (Validator) detects a test failure, it routes back here
+    with retry_reason="test_failure" and retry_error_message=<test output>.
+  - The Diagnostician re-reads the test output, revises its hypothesis,
+    and emits an updated FixPlan (max MAX_RETRIES attempts).
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
+import subprocess
 import textwrap
-import time
-from typing import Any
+from pathlib import Path
+from typing import Optional
+from openai import OpenAI
 
-from google import genai
-from google.genai import types as genai_types
-
-from pipeline.schema import (
+from agents.schemas import (
     AffectedRegion,
     ContextBundle,
-    FeedbackMessage,
+    FileContext,
     FixPlan,
-    LocalizerCandidate,
-    SWEInstance,
 )
 
-logger = logging.getLogger(__name__)
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-# ── Model config ──────────────────────────────────────────────────────────────
-
-_DEFAULT_MODEL = "gemini-2.5-flash"
-_MAX_TOKENS       = 4096
-_MAX_RETRIES      = 2          # LLM call retries on parse failure
-_FILE_LINE_LIMIT  = 300        # max lines per file shown in prompt
+MODEL = "llama4-scout-17b"
+BASE_URL = "https://openai.rc.asu.edu/v1"
+MAX_TOKENS = 4096
+MAX_RETRIES = 2          # Maximum times Validator can route back here
 
 
-# ── Prompt helpers ────────────────────────────────────────────────────────────
+# ── Prompt builders ───────────────────────────────────────────────────────────
 
-def _numbered(content: str, limit: int = _FILE_LINE_LIMIT) -> str:
-    """Return file content with 1-indexed line numbers, optionally truncated."""
-    lines = content.splitlines()
-    if len(lines) > limit:
-        half = limit // 2
-        middle = [f"  ... [{len(lines) - limit} lines omitted] ..."]
-        lines = lines[:half] + middle + lines[-half:]
-    return "\n".join(f"{i + 1:5d} | {ln}" for i, ln in enumerate(lines))
+def _format_file_block(fc: FileContext, max_lines: int = 300) -> str:
+    """Format a single file for inclusion in the prompt."""
+    lines = fc.content.splitlines()
+    if len(lines) > max_lines:
+        half = max_lines // 2
+        truncated = (
+            lines[:half]
+            + [f"\n... [{len(lines) - max_lines} lines omitted] ...\n"]
+            + lines[-half:]
+        )
+        body = "\n".join(truncated)
+    else:
+        body = fc.content
+
+    numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(body.splitlines()))
+    return f"### FILE: {fc.path}  (relevance={fc.relevance_score:.2f})\n```c\n{numbered}\n```"
 
 
-def _format_files(bundle: ContextBundle) -> str:
-    """Format all source files from the bundle for the prompt."""
+def _build_system_prompt() -> str:
+    return textwrap.dedent("""\
+        You are the Diagnostician agent in a multi-agent software engineering system.
+        Your job is to read a bug report and the actual C source files retrieved from
+        the repository, then produce a precise, structured fix plan.
+
+        Rules:
+        1. Base your analysis ONLY on the actual code shown — never hallucinate content.
+        2. Cite exact file paths and line numbers from the numbered source listings.
+        3. Be specific: identify the exact variable, condition, or logic that is wrong.
+        4. Consider test constraints — your fix must not break passing tests.
+        5. Output ONLY the JSON object described. No prose before or after it.
+
+        Output format (strict JSON, no markdown fences):
+        {
+          "root_cause": "<one paragraph explaining WHY the bug exists>",
+          "fix_description": "<what the patch should do, step by step>",
+          "affected_files": ["<path>", ...],
+          "affected_regions": [
+            {"file_path": "<path>", "start_line": <int>, "end_line": <int>, "reason": "<why>"},
+            ...
+          ],
+          "test_constraints": ["<thing the fix must preserve or satisfy>", ...],
+          "suggested_approach": "<high-level strategy for generating the diff>",
+          "confidence": <0.0–1.0>,
+          "requires_new_function": <true|false>,
+          "requires_header_change": <true|false>,
+          "diagnostician_notes": "<any extra notes for the Patcher>"
+        }
+    """)
+
+
+def _build_user_prompt(bundle: ContextBundle, retry_context: Optional[str] = None) -> str:
     parts: list[str] = []
-    for path, content in bundle.file_contents.items():
-        parts.append(f"### {path}\n```c\n{_numbered(content)}\n```")
-    # Also include snippet-level context if available
-    if bundle.relevant_snippets:
-        parts.append("### Relevant function snippets")
-        for node_id, snippet in bundle.relevant_snippets.items():
-            parts.append(f"#### {node_id}\n```c\n{snippet}\n```")
+
+    # Issue
+    parts.append("## ISSUE REPORT")
+    parts.append(f"**ID:** {bundle.issue_id}")
+    parts.append(f"**Repo:** {bundle.repo}  |  **Commit:** {bundle.base_commit}")
+    parts.append(f"**Type:** {bundle.planner_issue_type or 'unknown'}")
+    parts.append(f"**Keywords:** {', '.join(bundle.planner_keywords)}")
+    parts.append(f"\n**Title:** {bundle.issue_title}")
+    parts.append(f"\n**Description:**\n{bundle.issue_body}")
+
+    # Retry context (test failure routed back from Validator)
+    if retry_context:
+        parts.append("\n## PREVIOUS FIX FAILED — TEST OUTPUT")
+        parts.append(
+            "Your previous fix plan produced a patch that failed tests. "
+            "Read the test output carefully and revise your root cause hypothesis.\n"
+        )
+        parts.append(f"```\n{retry_context}\n```")
+
+    # Source files
+    parts.append("\n## LOCALIZED SOURCE FILES")
+    parts.append(
+        "These files were identified as relevant by the Localizer agent. "
+        "Line numbers are shown in the left margin."
+    )
+    for fc in bundle.source_files:
+        parts.append(_format_file_block(fc))
+
+    # Test files
+    if bundle.test_files:
+        parts.append("\n## RELEVANT TEST FILES")
+        parts.append(
+            "Use these to understand what the correct behavior should be."
+        )
+        for fc in bundle.test_files:
+            parts.append(_format_file_block(fc, max_lines=150))
+
+    # Task
+    parts.append("\n## YOUR TASK")
+    parts.append(
+        "Analyze the bug described in the issue. "
+        "Using only the source code shown above, identify the root cause "
+        "and produce the structured JSON fix plan. "
+        "Be precise about file paths and line numbers — the Patcher will use "
+        "them to generate the actual diff."
+    )
+
     return "\n\n".join(parts)
 
 
-def _format_candidates(candidates: list[LocalizerCandidate]) -> str:
-    lines = []
-    for c in candidates:
-        lines.append(
-            f"  - {c.file_path}  (score={c.score:.3f}, {c.reason})"
-            + (f"\n    functions: {c.functions}" if c.functions else "")
+# ── JSON extraction ───────────────────────────────────────────────────────────
+
+def _extract_json(text: str) -> dict:
+    """
+    Extract the JSON object from the LLM response.
+    Handles responses that may have accidental markdown fences.
+    """
+    # Strip ```json ... ``` fences if present
+    text = re.sub(r"```(?:json)?\s*", "", text).strip().rstrip("`").strip()
+
+    # Find the outermost { ... }
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError(f"No JSON object found in LLM response:\n{text[:500]}")
+
+    return json.loads(text[start:end])
+
+
+# ── FixPlan assembly ──────────────────────────────────────────────────────────
+
+def _assemble_fix_plan(issue_id: str, raw: dict) -> FixPlan:
+    """Convert the raw JSON dict from the LLM into a typed FixPlan."""
+    regions = [
+        AffectedRegion(
+            file_path=r["file_path"],
+            start_line=int(r["start_line"]),
+            end_line=int(r["end_line"]),
+            reason=r.get("reason", ""),
         )
-    return "\n".join(lines)
-
-
-# ── System prompt ─────────────────────────────────────────────────────────────
-
-_SYSTEM = textwrap.dedent("""\
-    You are the Diagnostician agent in a multi-agent software engineering pipeline.
-    You will be given a GitHub issue and the relevant C source files from the repository.
-    Your job is to identify the root cause of the bug and produce a precise fix plan.
-
-    Rules:
-    1. Base every claim on the actual code shown — never invent content.
-    2. Cite exact file paths and line numbers from the numbered listings.
-    3. Be specific: name the exact variable, condition, or logic that is wrong.
-    4. Your fix plan will be used by a Patcher agent that generates the actual diff —
-       be as concrete as possible about what needs to change and where.
-    5. Output ONLY a single JSON object. No prose before or after it.
-       No markdown fences. No explanation outside the JSON.
-
-    Required JSON schema (all fields mandatory):
-    {
-      "root_cause": "<one paragraph: why does this bug exist?>",
-      "fix_description": "<step-by-step: what must the patch do?>",
-      "affected_files": ["<repo-relative path>", ...],
-      "affected_regions": [
-        {
-          "file_path": "<repo-relative path>",
-          "start_line": <int>,
-          "end_line": <int>,
-          "description": "<why this region needs to change>"
-        }
-      ],
-      "test_constraints": ["<what the fix must not break>", ...],
-      "fix_description": "<high-level strategy for the Patcher>",
-      "confidence": <float 0.0–1.0>
-    }
-""")
-
-
-# ── User prompt builders ──────────────────────────────────────────────────────
-
-def _build_diagnose_prompt(instance: SWEInstance, bundle: ContextBundle) -> str:
-    sections: list[str] = []
-
-    sections.append("## Issue report")
-    sections.append(
-        f"**Repo:** {instance.repo}  |  **Commit:** {instance.base_commit}\n"
-        f"**Instance:** {instance.instance_id}\n\n"
-        f"{instance.problem_statement.strip()}"
-    )
-
-    if instance.hints_text and instance.hints_text.strip():
-        sections.append("## Additional hints\n" + instance.hints_text.strip())
-
-    sections.append("## Localizer candidates (ranked by relevance)")
-    sections.append(_format_candidates(bundle.candidates))
-
-    sections.append("## Source files")
-    sections.append(
-        "Line numbers are in the left margin. "
-        "Do NOT include them when citing lines — use the integer only."
-    )
-    sections.append(_format_files(bundle))
-
-    if bundle.test_files:
-        sections.append("## Test files")
-        sections.append(
-            "Use these to understand what correct behaviour looks like."
-        )
-        for tf in bundle.test_files:
-            content = bundle.file_contents.get(tf, "")
-            if content:
-                sections.append(f"### {tf}\n```c\n{_numbered(content, limit=150)}\n```")
-
-    sections.append("## Task")
-    sections.append(
-        "Analyse the bug. Using only the source code above, "
-        "identify the root cause and output the JSON fix plan."
-    )
-    return "\n\n".join(sections)
-
-
-def _build_revise_prompt(
-    instance: SWEInstance,
-    bundle: ContextBundle,
-    feedback: FeedbackMessage,
-) -> str:
-    base = _build_diagnose_prompt(instance, bundle)
-    revision = textwrap.dedent(f"""\
-        ## Previous fix failed — validator evidence
-
-        Your previous fix plan produced a patch that was rejected.
-        Failure type: **{feedback.failure_type.value}**
-        Retry number: {feedback.retry_number}
-
-        Evidence:
-        ```
-        {feedback.evidence}
-        ```
-
-        Re-examine the code with this evidence in mind.
-        Revise your root cause hypothesis and produce an updated JSON fix plan.
-    """)
-    return base + "\n\n" + revision
-
-
-# ── JSON parsing ──────────────────────────────────────────────────────────────
-
-def _strip_fences(text: str) -> str:
-    """Remove accidental ```json ... ``` fences."""
-    text = re.sub(r"^```[a-zA-Z]*\s*", "", text.strip())
-    text = re.sub(r"\s*```$", "", text.strip())
-    return text.strip()
-
-
-def _parse_fix_plan(instance_id: str, raw: dict[str, Any]) -> FixPlan:
-    regions: list[AffectedRegion] = []
-    for r in raw.get("affected_regions", []):
-        regions.append(
-            AffectedRegion(
-                file_path=r["file_path"],
-                start_line=int(r["start_line"]),
-                end_line=int(r["end_line"]),
-                description=r.get("description", r.get("reason", "")),
-            )
-        )
+        for r in raw.get("affected_regions", [])
+    ]
     return FixPlan(
-        instance_id=instance_id,
-        root_cause=str(raw.get("root_cause", "")),
-        fix_description=str(raw.get("fix_description", "")),
-        affected_files=list(raw.get("affected_files", [])),
+        issue_id=issue_id,
+        root_cause=raw.get("root_cause", ""),
+        fix_description=raw.get("fix_description", ""),
+        affected_files=raw.get("affected_files", []),
         affected_regions=regions,
-        test_constraints=list(raw.get("test_constraints", [])),
+        test_constraints=raw.get("test_constraints", []),
+        suggested_approach=raw.get("suggested_approach", ""),
+        confidence=float(raw.get("confidence", 0.5)),
+        requires_new_function=bool(raw.get("requires_new_function", False)),
+        requires_header_change=bool(raw.get("requires_header_change", False)),
+        diagnostician_notes=raw.get("diagnostician_notes", ""),
     )
 
 
-# ── LLM call ─────────────────────────────────────────────────────────────────
+# ── Test runner (optional — runs existing tests to observe failures) ──────────
 
-def _call_llm(
-    client,
-    model: str,
-    system: str,
-    user: str,
+def run_failing_tests(
+    repo_root: str,
+    test_files: list[FileContext],
+    timeout: int = 60,
 ) -> str:
-    last_exc: Exception | None = None
-    for attempt in range(1, _MAX_RETRIES + 2):
-        if attempt > 1:
-            wait = 2 ** attempt
-            logger.warning("Diagnostician LLM retry %d after %ds", attempt, wait)
-            time.sleep(wait)
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=f"{system}\n\n{user}",
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=_MAX_TOKENS,
-                ),
-            )
-            return response.text or ""
-        except Exception as exc:
-            logger.error("Diagnostician LLM call failed (attempt %d): %s", attempt, exc)
-            last_exc = exc
-    raise RuntimeError(
-        f"Diagnostician failed after {_MAX_RETRIES + 1} attempts"
-    ) from last_exc
+    """
+    Attempt to run the repository's test suite and capture output.
+
+    This gives the Diagnostician real test failure messages to reason about.
+    Returns the combined stdout+stderr string (empty string on error).
+    """
+    repo_path = Path(repo_root)
+    if not repo_path.exists():
+        return ""
+
+    # Try `make check` / `make test` — common in C repos
+    for target in ("check", "test", "tests"):
+        result = subprocess.run(
+            ["make", target],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = result.stdout + result.stderr
+        # Return as soon as we get any meaningful output
+        if output.strip():
+            # Truncate to avoid giant prompts
+            if len(output) > 4000:
+                output = output[:2000] + "\n...[truncated]...\n" + output[-2000:]
+            return output
+
+    return ""
 
 
-# ── Public agent class ────────────────────────────────────────────────────────
+# ── Main public API ───────────────────────────────────────────────────────────
 
-class DiagnosticianAgent:
-    """LLM-backed Diagnostician agent.
-
-    Implements the interface required by pipeline/controller.py:
-        diagnose(instance, bundle)         → FixPlan
-        revise(instance, bundle, feedback) → FixPlan
+def diagnose(
+    bundle: ContextBundle,
+    *,
+    run_tests: bool = False,
+    retry_error_message: Optional[str] = None,
+    attempt: int = 1,
+    api_key: Optional[str] = None,
+) -> FixPlan:
+    """
+    Run the Diagnostician agent on a ContextBundle.
 
     Args:
-        model_name: Model identifier to use with Vertex AI.
+        bundle:              Output from the Localizer (Person 3).
+        run_tests:           If True, run `make check` first and feed output to LLM.
+        retry_error_message: Test failure output routed back from Validator.
+                             When set, the agent re-diagnoses with this context.
+        attempt:             Which retry attempt this is (1 = first run).
+        api_key:             Anthropic API key; falls back to ANTHROPIC_API_KEY env var.
 
-    Environment variables:
-        VERTEXAI_PROJECT:  GCP project ID (required)
-        VERTEXAI_LOCATION: GCP location (default: us-central1)
-        MODEL_NAME:        Model to use (default: gemini-1.5-flash-002)
+    Returns:
+        A FixPlan ready for the Patcher agent.
     """
+    client = OpenAI(
+        base_url=BASE_URL,
+        api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+    )
+    # Optionally gather live test output
+    test_output: Optional[str] = retry_error_message
+    if run_tests and not test_output and bundle.repo_root:
+        print(f"  [Diagnostician] Running tests in {bundle.repo_root} ...")
+        test_output = run_failing_tests(bundle.repo_root, bundle.test_files)
+        if test_output:
+            print(f"  [Diagnostician] Captured {len(test_output)} chars of test output")
 
-    def __init__(
-        self,
-        model_name: str | None = None,
-    ) -> None:
-        # Use provided model name, or fall back to MODEL_NAME env var, or use default
-        self._model = model_name or os.environ.get("MODEL_NAME", _DEFAULT_MODEL)
+    system = _build_system_prompt()
+    user = _build_user_prompt(bundle, retry_context=test_output)
 
-        # Initialize google-genai client with Vertex AI
-        project = os.environ.get("VERTEXAI_PROJECT")
-        location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
+    print(f"  [Diagnostician] Calling LLM (attempt {attempt}) for {bundle.issue_id} ...")
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    raw_text = response.choices[0].message.content
+    raw_dict = _extract_json(raw_text)
+    plan = _assemble_fix_plan(bundle.issue_id, raw_dict)
 
-        if not project:
-            raise ValueError("VERTEXAI_PROJECT environment variable must be set")
+    if retry_error_message:
+        plan.retry_reason = "test_failure"
+        plan.retry_error_message = retry_error_message
 
-        self._client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
+    print(
+        f"  [Diagnostician] Done. confidence={plan.confidence:.2f}, "
+        f"files={plan.affected_files}, regions={len(plan.affected_regions)}"
+    )
+    return plan
+
+
+# ── Retry entry point (called by Validator / orchestrator) ────────────────────
+
+def rediagnose(
+    bundle: ContextBundle,
+    error_message: str,
+    attempt: int = 2,
+    api_key: Optional[str] = None,
+) -> FixPlan:
+    """
+    Re-run diagnosis after a test failure (Loop C in the proposal).
+
+    The Validator calls this when `make test` fails after applying the patch.
+    The error_message is the test runner's stdout+stderr.
+    """
+    if attempt > MAX_RETRIES + 1:
+        raise RuntimeError(
+            f"Diagnostician exceeded MAX_RETRIES ({MAX_RETRIES}) for {bundle.issue_id}"
         )
-
-    # ── Public methods (match stub interface exactly) ─────────────────────────
-    def diagnose(self, instance, bundle):
-        logger.info(
-            "[%s] Diagnostician.diagnose — %d files, confidence=%.2f",
-            instance.instance_id,
-            len(bundle.file_contents),
-            bundle.confidence,
-        )
-        user = _build_diagnose_prompt(instance, bundle)
-        text = _call_llm(self._client, self._model, _SYSTEM, user)
-        text = _strip_fences(text)
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            raise ValueError(f"No JSON object in response: {text[:300]}")
-        raw  = json.loads(text[start:end])
-        plan = _parse_fix_plan(instance.instance_id, raw)
-        logger.info(
-            "[%s] FixPlan: files=%s, regions=%d",
-            instance.instance_id,
-            plan.affected_files,
-            len(plan.affected_regions),
-        )
-        return plan
-
-    def revise(self, instance, bundle, feedback):
-        logger.info(
-            "[%s] Diagnostician.revise — failure=%s retry=%d",
-            instance.instance_id,
-            feedback.failure_type.value,
-            feedback.retry_number,
-        )
-        user = _build_revise_prompt(instance, bundle, feedback)
-        text = _call_llm(self._client, self._model, _SYSTEM, user)
-        text = _strip_fences(text)
-        start = text.find("{")
-        end   = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            raise ValueError(f"No JSON object in response: {text[:300]}")
-        raw  = json.loads(text[start:end])
-        plan = _parse_fix_plan(instance.instance_id, raw)
-        logger.info(
-            "[%s] Revised FixPlan: files=%s, regions=%d",
-            instance.instance_id,
-            plan.affected_files,
-            len(plan.affected_regions),
-        )
-        return plan
+    return diagnose(
+        bundle,
+        run_tests=False,         # We already have the error from Validator
+        retry_error_message=error_message,
+        attempt=attempt,
+        api_key=api_key,
+    )
