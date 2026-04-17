@@ -370,13 +370,14 @@ def test_pipeline_integration() -> None:
 
         result = ctrl.run(instance, g)
 
-    check("Controller completes without crash", result is not None)
-    check("Result has instance_id",
-          result.instance_id == instance.instance_id)
-    check("apply_ok True (stub validator)",
-          result.apply_ok is True, f"got {result.apply_ok}")
-    check("Log dir created",
-          any((Path(tmp) / "logs").iterdir()) if (Path(tmp) / "logs").exists() else False)
+        check("Controller completes without crash", result is not None)
+        check("Result has instance_id",
+            result.instance_id == instance.instance_id)
+        check("apply_ok True (stub validator)",
+            result.apply_ok is True, f"got {result.apply_ok}")
+        check("Log dir created",
+            any((Path(tmp) / "logs").iterdir()) if (Path(tmp) / "logs").exists() else False)
+
     print(f"  result.status:   {result.status}")
     print(f"  result.resolved: {result.resolved}")
 
