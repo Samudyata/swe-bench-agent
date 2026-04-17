@@ -1,212 +1,190 @@
-"""
-patcher.py — Patcher Agent (Agent 4)
+"""Patcher agent — generates a unified diff from a FixPlan and real source files.
 
-Reads the FixPlan from the Diagnostician and the actual source files,
-then generates a syntactically correct unified diff ready for `git apply`.
+Implements the interface defined in agents/stubs.py:
 
-The key guarantee: context lines in the diff are copied from REAL file
-content, not hallucinated. This directly solves the 90%+ localization
-failure from Phase 1.
+    patch(instance, fix_plan, bundle)                    → PatchOutput
+    patch_with_feedback(instance, fix_plan, bundle, fb)  → PatchOutput
 
-Inputs  (from Diagnostician):  FixPlan + real file contents
-Outputs (to Person 5):         PatchResult containing a unified diff
+The core guarantee: context lines in every diff hunk are copied from REAL file
+content (read from bundle.file_contents, fallback to disk).  This directly
+addresses the 90%+ git-apply failure rate from Phase 1.
 
-Retry handling:
-  - If Person 5 (Validator) detects a compilation error, it routes back
-    here with retry_reason="compilation_error" and the compiler output.
-  - The Patcher re-generates the diff with the error appended (max MAX_RETRIES).
+Usage
+-----
+    from agents.patcher import PatcherAgent
+    agent = PatcherAgent()
+    result = agent.patch(instance, fix_plan, bundle)
+
+    # On compilation error from Validator (Loop B):
+    result = agent.patch_with_feedback(instance, fix_plan, bundle, feedback)
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import textwrap
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
-from openai import OpenAI
-from agents.schemas import FileContext, FixPlan, PatchResult
+from google import genai
+from google.genai import types as genai_types
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+from pipeline.schema import (
+    ContextBundle,
+    FeedbackMessage,
+    FixPlan,
+    PatchOutput,
+    SWEInstance,
+)
 
-MODEL = "llama4-scout-17b"
-BASE_URL = "https://openai.rc.asu.edu/v1"
-MAX_TOKENS = 4096
-MAX_RETRIES = 2
+logger = logging.getLogger(__name__)
 
+# ── Model config ──────────────────────────────────────────────────────────────
 
-# ── File reading ──────────────────────────────────────────────────────────────
-
-def _read_file(repo_root: str, rel_path: str) -> Optional[str]:
-    """Read a file from disk. Returns None if not found."""
-    full = Path(repo_root) / rel_path
-    if full.exists():
-        try:
-            return full.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-    return None
+_DEFAULT_MODEL = "gemini-2.5-flash"
+_MAX_TOKENS       = 4096
+_MAX_RETRIES      = 2
 
 
-def _load_affected_files(
-    plan: FixPlan,
+# ── File loading ──────────────────────────────────────────────────────────────
+
+def _get_file_contents(
+    fix_plan: FixPlan,
+    bundle: ContextBundle,
     repo_root: str,
-    preloaded: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     """
-    Return {rel_path: content} for every file in plan.affected_files.
+    Return {rel_path: content} for every file in fix_plan.affected_files.
 
-    Preloaded content (from the ContextBundle) is preferred; disk is the
-    fallback to ensure we always have real content.
+    Priority: bundle.file_contents (already in memory) → disk fallback.
+    This ensures context lines always come from real source, never hallucination.
     """
     result: dict[str, str] = {}
-    for rel_path in plan.affected_files:
-        if preloaded and rel_path in preloaded:
-            result[rel_path] = preloaded[rel_path]
+    for rel in fix_plan.affected_files:
+        if rel in bundle.file_contents:
+            result[rel] = bundle.file_contents[rel]
+        elif repo_root:
+            full = Path(repo_root) / rel
+            try:
+                result[rel] = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logger.warning("[Patcher] Cannot read %s from disk", full)
         else:
-            content = _read_file(repo_root, rel_path)
-            if content is not None:
-                result[rel_path] = content
-            else:
-                print(f"  [Patcher] WARNING: cannot read {rel_path} from {repo_root}")
+            logger.warning("[Patcher] %s not in bundle and no repo_root", rel)
     return result
 
-def _format_file_with_lines(path: str, content: str) -> str:
+
+def _numbered(content: str, limit: int = 300) -> str:
+    """Return file content with 1-indexed line numbers."""
     lines = content.splitlines()
-    numbered = "\n".join(f"{i+1:5d} | {line}" for i, line in enumerate(lines))
-    return (
-        f"### {path}\n"
-        f"<!-- Line numbers shown for reference only. "
-        f"Do NOT include them in the diff context lines. -->\n"
-        f"```c\n{numbered}\n```"
+    if len(lines) > limit:
+        half = limit // 2
+        middle = [f"  ... [{len(lines) - limit} lines omitted] ..."]
+        lines = lines[:half] + middle + lines[-half:]
+    return "\n".join(f"{i + 1:5d} | {ln}" for i, ln in enumerate(lines))
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+_SYSTEM = textwrap.dedent("""\
+    You are the Patcher agent in a multi-agent software engineering pipeline.
+    You generate a valid unified diff that implements a given fix plan.
+
+    CRITICAL — the diff MUST pass `git apply` on the first attempt:
+
+    1. Context lines MUST be copied EXACTLY from the file listings provided.
+       Do NOT paraphrase, reformat, or reconstruct them.  Character-for-character.
+    2. Do NOT include the line-number margin (e.g. "   12 | ") in the diff.
+       Copy only the actual source text that appears after the pipe character.
+    3. Unified diff format:
+         --- a/<path>
+         +++ b/<path>
+         @@ -<start>,<count> +<start>,<count> @@
+       followed by lines prefixed with ' ' (context), '-' (removed), '+' (added).
+    4. Include exactly 3 lines of unchanged context before and after each change.
+    5. @@ line numbers must match the actual file content shown.
+    6. For multiple files, concatenate hunks — one diff --git header per file.
+    7. Output ONLY the raw unified diff.  Start with "diff --git" or "---".
+       No prose, no markdown fences, no explanation whatsoever.
+
+    When a compilation error is provided:
+    - Read the error message carefully.
+    - An "undeclared identifier" → add the missing #include or declaration.
+    - A "type mismatch" → add a cast or correct the type.
+    - Fix only what the error describes — do not rewrite unrelated code.
+""")
+
+
+# ── User prompt builders ──────────────────────────────────────────────────────
+
+def _build_patch_prompt(
+    instance: SWEInstance,
+    fix_plan: FixPlan,
+    file_contents: dict[str, str],
+    feedback: FeedbackMessage | None = None,
+) -> str:
+    sections: list[str] = []
+
+    sections.append("## Fix plan")
+    sections.append(
+        f"**Instance:** {instance.instance_id}\n"
+        f"**Root cause:** {fix_plan.root_cause}\n\n"
+        f"**What the patch must do:**\n{fix_plan.fix_description}"
     )
 
-
-# ── Prompt builders ───────────────────────────────────────────────────────────
-
-def _build_system_prompt() -> str:
-    return textwrap.dedent("""\
-        You are the Patcher agent in a multi-agent software engineering system.
-        Your job is to generate a valid unified diff that implements a fix plan.
-
-        CRITICAL RULES — the patch MUST pass `git apply` on the first try:
-
-        1. COPY context lines EXACTLY from the file listings shown. Do NOT paraphrase,
-           reformat, or reconstruct them from memory. Character-for-character accuracy.
-        2. Use the correct unified diff format:
-             --- a/<path>
-             +++ b/<path>
-             @@ -<start>,<count> +<start>,<count> @@
-           followed by context lines (space prefix), removals (- prefix), additions (+ prefix).
-        3. Include 3 lines of unchanged context before and after each changed region.
-        4. Line numbers in @@ headers must match the actual file content shown.
-        5. Do NOT create new files unless the fix plan explicitly says requires_new_function
-           and the function must live in a new file.
-        6. If multiple files need changes, concatenate their hunks in one diff output.
-        7. Output ONLY the raw unified diff. No prose, no markdown fences, no explanation.
-           Start your response with "diff --git" or "---".
-        8. Context lines in the diff must NOT include the line number margin
-            (e.g. '  12 | ') — copy only the actual code after the pipe character.
-
-        If a compilation error is provided, read it carefully:
-        - An "undeclared identifier" means you need to add a declaration or #include.
-        - A "type mismatch" means you need to cast or change the type.
-        - Fix only what the error describes — do not rewrite unrelated code.
-    """)
-
-
-def _build_user_prompt(
-    plan: FixPlan,
-    file_contents: dict[str, str],
-    compilation_error: Optional[str] = None,
-) -> str:
-    parts: list[str] = []
-
-    # Fix plan summary
-    parts.append("## FIX PLAN FROM DIAGNOSTICIAN")
-    parts.append(f"**Issue ID:** {plan.issue_id}")
-    parts.append(f"**Root cause:** {plan.root_cause}")
-    parts.append(f"**What the patch must do:**\n{plan.fix_description}")
-    parts.append(f"**Suggested approach:** {plan.suggested_approach}")
-
-    if plan.diagnostician_notes:
-        parts.append(f"**Diagnostician notes:** {plan.diagnostician_notes}")
-
-    if plan.test_constraints:
-        parts.append("**Test constraints (must not break):**")
-        for c in plan.test_constraints:
-            parts.append(f"  - {c}")
-
-    # Affected regions
-    if plan.affected_regions:
-        parts.append("\n**Affected regions (focus your changes here):**")
-        for r in plan.affected_regions:
-            parts.append(
-                f"  - `{r.file_path}` lines {r.start_line}–{r.end_line}: {r.reason}"
+    if fix_plan.affected_regions:
+        sections.append("**Affected regions (focus your changes here):**")
+        for r in fix_plan.affected_regions:
+            sections.append(
+                f"  - `{r.file_path}` lines {r.start_line}–{r.end_line}: {r.description}"
             )
 
-    # Compilation error retry context
-    if compilation_error:
-        parts.append("\n## COMPILATION ERROR — YOUR PREVIOUS PATCH DID NOT COMPILE")
-        parts.append(
-            "Read the compiler output below and fix ONLY the compilation issue. "
-            "Do not change unrelated code.\n"
+    if fix_plan.test_constraints:
+        sections.append("**Must not break:**")
+        for c in fix_plan.test_constraints:
+            sections.append(f"  - {c}")
+
+    # Retry context from Validator
+    if feedback is not None:
+        sections.append("## Previous patch rejected — validator evidence")
+        sections.append(
+            f"Failure type: **{feedback.failure_type.value}**\n\n"
+            f"```\n{feedback.evidence}\n```\n\n"
+            "Fix only what the evidence describes. Do not rewrite unrelated code."
         )
-        parts.append(f"```\n{compilation_error}\n```")
 
-    # Actual file contents
-    parts.append("\n## ACTUAL FILE CONTENTS")
-    parts.append(
-        "The files below contain the EXACT current source. "
-        "You MUST copy context lines verbatim from these listings. "
-        "Line numbers are shown in the left margin."
+    sections.append("## Actual file contents")
+    sections.append(
+        "Copy context lines VERBATIM from these listings — "
+        "only the text AFTER the pipe character, not the line number."
     )
-    for rel_path, content in file_contents.items():
-        parts.append(_format_file_with_lines(rel_path, content))
+    for rel, content in file_contents.items():
+        sections.append(f"### {rel}\n```c\n{_numbered(content)}\n```")
 
-    # Task
-    parts.append("\n## YOUR TASK")
-    parts.append(
-        "Generate a unified diff that implements the fix plan above. "
-        "Every context line must be copied exactly from the file listings. "
+    sections.append("## Task")
+    sections.append(
+        "Generate the unified diff that implements the fix plan above. "
         "Output ONLY the diff — nothing else."
     )
+    return "\n\n".join(sections)
 
-    return "\n\n".join(parts)
 
+# ── Diff cleanup ──────────────────────────────────────────────────────────────
 
-# ── Diff validation (lightweight, before handing to Validator) ────────────────
-
-def _basic_diff_checks(diff: str, file_contents: dict[str, str]) -> list[str]:
-    """
-    Run quick sanity checks on the generated diff.
-    Returns a list of warning strings (empty = looks OK).
-    """
-    warnings: list[str] = []
-
-    if not diff.strip():
-        warnings.append("Empty diff generated")
-        return warnings
-
-    if "---" not in diff or "+++" not in diff:
-        warnings.append("Diff missing --- / +++ headers")
-
-    if "@@ " not in diff:
-        warnings.append("Diff has no hunk headers (@@)")
-
-    # Check that files referenced in diff exist in our content dict
-    for line in diff.splitlines():
-        if line.startswith("--- a/") or line.startswith("+++ b/"):
-            path = line.split("/", 1)[1].strip()
-            if path not in file_contents and path != "/dev/null":
-                warnings.append(f"Diff references unknown file: {path}")
-
-    return warnings
+def _clean_diff(text: str) -> str:
+    """Strip markdown fences if the model added them despite instructions."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip()
 
 
 def _extract_modified_files(diff: str) -> list[str]:
-    """Parse the diff to find which files are being modified."""
+    """Parse +++ b/<path> lines to find which files the diff touches."""
     files: list[str] = []
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
@@ -216,120 +194,179 @@ def _extract_modified_files(diff: str) -> list[str]:
     return files
 
 
-# ── Main public API ───────────────────────────────────────────────────────────
+def _basic_diff_sanity(diff: str) -> list[str]:
+    """Return a list of warning strings (empty = looks OK)."""
+    warnings: list[str] = []
+    if not diff.strip():
+        warnings.append("empty diff")
+        return warnings
+    if "---" not in diff or "+++" not in diff:
+        warnings.append("missing --- / +++ headers")
+    if "@@ " not in diff:
+        warnings.append("no hunk headers (@@)")
+    # Detect leftover line-number margins like "   12 | "
+    if re.search(r"^[ +-]\s{0,5}\d+\s+\|", diff, re.MULTILINE):
+        warnings.append("line-number margin leaked into diff context lines")
+    return warnings
 
-def patch(
-    plan: FixPlan,
-    repo_root: str,
-    *,
-    preloaded_files: Optional[dict[str, str]] = None,
-    compilation_error: Optional[str] = None,
-    attempt: int = 1,
-    api_key: Optional[str] = None,
-) -> PatchResult:
-    """
-    Run the Patcher agent to generate a unified diff.
+
+# ── LLM call ─────────────────────────────────────────────────────────────────
+
+def _call_llm(
+    client,
+    model: str,
+    system: str,
+    user: str,
+) -> str:
+    """Call the LLM and return the raw text response, retrying on failure."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 2):
+        if attempt > 1:
+            wait = 2 ** attempt
+            logger.warning("Patcher LLM retry %d after %ds", attempt, wait)
+            time.sleep(wait)
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=f"{system}\n\n{user}",
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=_MAX_TOKENS,
+                ),
+            )
+            return response.text or ""
+        except Exception as exc:
+            logger.error("Patcher LLM call failed (attempt %d): %s", attempt, exc)
+            last_exc = exc
+    raise RuntimeError(
+        f"Patcher failed after {_MAX_RETRIES + 1} attempts"
+    ) from last_exc
+
+
+# ── Public agent class ────────────────────────────────────────────────────────
+
+class PatcherAgent:
+    """LLM-backed Patcher agent.
+
+    Implements the interface required by pipeline/controller.py:
+        patch(instance, fix_plan, bundle)                   → PatchOutput
+        patch_with_feedback(instance, fix_plan, bundle, fb) → PatchOutput
 
     Args:
-        plan:               FixPlan from the Diagnostician.
-        repo_root:          Absolute path to the repository on disk.
-        preloaded_files:    {rel_path: content} pre-read by earlier agents.
-                            Used so we don't re-read files unnecessarily.
-        compilation_error:  Compiler output routed back from Validator (Loop B).
-        attempt:            Retry attempt number.
-        api_key:            Anthropic API key; falls back to ANTHROPIC_API_KEY env var.
+        model_name: Model identifier to use with Vertex AI.
+        repo_root:  Optional override for where to read files from disk.
+                    In normal use the bundle already contains file_contents.
 
-    Returns:
-        PatchResult with the unified diff and metadata.
+    Environment variables:
+        VERTEXAI_PROJECT:  GCP project ID (required)
+        VERTEXAI_LOCATION: GCP location (default: us-central1)
+        MODEL_NAME:        Model to use (default: gemini-1.5-flash-002)
     """
-    client = OpenAI(
-    base_url=BASE_URL,
-    api_key=api_key or os.environ.get("OPENAI_API_KEY"),
-    )
 
-    # Load the actual file contents — this is what makes the diff reliable
-    file_contents = _load_affected_files(plan, repo_root, preloaded=preloaded_files)
-    if not file_contents:
-        raise RuntimeError(
-            f"[Patcher] Could not read any affected files for {plan.issue_id}. "
-            f"Affected: {plan.affected_files}, repo_root: {repo_root}"
+    def __init__(
+        self,
+        model_name: str | None = None,
+        repo_root: str = "",
+    ) -> None:
+        # Use provided model name, or fall back to MODEL_NAME env var, or use default
+        self._model = model_name or os.environ.get("MODEL_NAME", _DEFAULT_MODEL)
+        self._repo_root = repo_root
+
+        # Initialize google-genai client with Vertex AI
+        project = os.environ.get("VERTEXAI_PROJECT")
+        location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
+
+        if not project:
+            raise ValueError("VERTEXAI_PROJECT environment variable must be set")
+
+        self._client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
         )
 
-    system = _build_system_prompt()
-    user = _build_user_prompt(plan, file_contents, compilation_error=compilation_error)
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-    print(f"  [Patcher] Calling LLM (attempt {attempt}) for {plan.issue_id} ...")
-    response = client.chat.completions.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    diff_text = response.choices[0].message.content.strip()
+    def _run(
+        self,
+        instance: SWEInstance,
+        fix_plan: FixPlan,
+        bundle: ContextBundle,
+        feedback: FeedbackMessage | None,
+        attempt: int,
+    ) -> PatchOutput:
+        repo_root = self._repo_root or getattr(instance, "repo_root", "")
+        file_contents = _get_file_contents(fix_plan, bundle, repo_root)
 
-    # Strip accidental markdown fences if the model added them
-    if diff_text.startswith("```"):
-        diff_text = re.sub(r"^```[a-z]*\n?", "", diff_text)
-        diff_text = re.sub(r"\n?```$", "", diff_text).strip()
+        if not file_contents:
+            logger.error(
+                "[%s] Patcher: no file contents available for %s",
+                instance.instance_id,
+                fix_plan.affected_files,
+            )
+            # Return empty patch rather than crashing — Validator will handle it
+            return PatchOutput(
+                instance_id=instance.instance_id,
+                unified_diff="",
+                affected_files=fix_plan.affected_files,
+            )
 
-    # Sanity checks
-    warnings = _basic_diff_checks(diff_text, file_contents)
-    if warnings:
-        print(f"  [Patcher] Diff warnings: {warnings}")
-
-    modified = _extract_modified_files(diff_text)
-    notes = f"attempt={attempt}"
-    if warnings:
-        notes += f"; warnings={warnings}"
-    if compilation_error:
-        notes += "; retry_after_compilation_error"
-
-    result = PatchResult(
-        issue_id=plan.issue_id,
-        patch=diff_text,
-        modified_files=modified or plan.affected_files,
-        fix_plan=plan,
-        patcher_notes=notes,
-        attempt_number=attempt,
-    )
-
-    print(
-        f"  [Patcher] Done. {len(diff_text)} chars, "
-        f"files={result.modified_files}, warnings={len(warnings)}"
-    )
-    return result
-
-
-# ── Retry entry point (called by Validator on compilation error) ──────────────
-
-def repatch(
-    plan: FixPlan,
-    repo_root: str,
-    compilation_error: str,
-    attempt: int = 2,
-    preloaded_files: Optional[dict[str, str]] = None,
-    api_key: Optional[str] = None,
-) -> PatchResult:
-    """
-    Re-generate the patch after a compilation error (Loop B in the proposal).
-
-    The Validator calls this when `gcc`/`make` rejects the patch.
-    The compilation_error is the compiler's stdout+stderr.
-    """
-    if attempt > MAX_RETRIES + 1:
-        raise RuntimeError(
-            f"Patcher exceeded MAX_RETRIES ({MAX_RETRIES}) for {plan.issue_id}"
+        user = _build_patch_prompt(instance, fix_plan, file_contents, feedback)
+        logger.info(
+            "[%s] Patcher calling LLM (attempt %d), files=%s",
+            instance.instance_id, attempt, list(file_contents.keys()),
         )
-    plan.retry_reason = "compilation_error"
-    plan.retry_error_message = compilation_error
 
-    return patch(
-        plan,
-        repo_root,
-        preloaded_files=preloaded_files,
-        compilation_error=compilation_error,
-        attempt=attempt,
-        api_key=api_key,
-    )
+        raw  = _call_llm(self._client, self._model, _SYSTEM, user)
+        diff = _clean_diff(raw)
+
+        warnings = _basic_diff_sanity(diff)
+        if warnings:
+            logger.warning("[%s] Patcher diff warnings: %s", instance.instance_id, warnings)
+
+        modified = _extract_modified_files(diff) or fix_plan.affected_files
+        logger.info(
+            "[%s] Patcher done: %d chars, files=%s, warnings=%s",
+            instance.instance_id, len(diff), modified, warnings,
+        )
+        return PatchOutput(
+            instance_id=instance.instance_id,
+            unified_diff=diff,
+            affected_files=modified,
+        )
+
+    # ── Public methods (match stub interface exactly) ─────────────────────────
+
+    def patch(
+        self,
+        instance: SWEInstance,
+        fix_plan: FixPlan,
+        bundle: ContextBundle,
+    ) -> PatchOutput:
+        """Generate a unified diff from the fix plan and localised source code.
+
+        Called by the pipeline controller on the first attempt.
+        """
+        return self._run(instance, fix_plan, bundle, feedback=None, attempt=1)
+
+    def patch_with_feedback(
+        self,
+        instance: SWEInstance,
+        fix_plan: FixPlan,
+        bundle: ContextBundle,
+        feedback: FeedbackMessage,
+    ) -> PatchOutput:
+        """Retry patch generation with compiler/apply error evidence appended.
+
+        Called on Loop B (compilation error) routed back from the Validator.
+        """
+        logger.info(
+            "[%s] Patcher.patch_with_feedback — failure=%s retry=%d",
+            instance.instance_id,
+            feedback.failure_type.value,
+            feedback.retry_number,
+        )
+        return self._run(
+            instance, fix_plan, bundle, feedback=feedback,
+            attempt=feedback.retry_number + 1,
+        )
