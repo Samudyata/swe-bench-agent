@@ -56,22 +56,92 @@ ONLINE (per issue)
 
 The key infrastructure enabling cross-file reasoning. Built offline per repository using [tree-sitter](https://tree-sitter.github.io/) (no compilation required).
 
-**Nodes:** Files (`.c`, `.h`) and functions (name + file + line range)
-
-**Edges (with confidence scores):**
-| Edge Type | What It Captures | Confidence |
-|---|---|---|
-| `include` | File A `#include`s File B | 1.0 |
-| `call` | Function F calls Function G (unique resolution) | 0.95 |
-| `call` | Function F calls G (ambiguous, N candidates) | 0.95/N |
-| `type_use` | File A uses a struct defined in File B | 0.7 |
-| `test` | Test file T exercises source file S | 0.8 |
-
 **Why not just grep?** A fix in `compress.c` may require a struct from `zstd_internal.h` and a function from `compress_impl.c` — neither contains issue keywords. The graph captures these structural relationships explicitly.
 
 **Smarter-than-static mechanisms:**
 1. **Edge confidence scoring** — Every edge gets a confidence (0.0-1.0) based on resolution certainty. Ambiguous call targets get proportionally lower confidence.
 2. **Keyword-weighted traversal** — Issue keywords score nodes, then BFS expands only through edges above a confidence threshold, producing focused "evidence subgraphs" instead of noisy full neighborhoods.
+
+#### Graph Schema
+
+Each graph is serialized as a JSON file with the following top-level structure:
+
+```json
+{
+  "repo":   "<owner/name>",
+  "commit": "<git-commit-hash>",
+  "nodes":  { "<node_id>": { ... } },
+  "edges":  [ { ... } ]
+}
+```
+
+**Node types:**
+
+There are two kinds of nodes, distinguished by the `kind` field.
+
+*File node* — represents a `.c` or `.h` source file:
+
+```json
+"src/jv.c": {
+  "id":   "src/jv.c",
+  "kind": "file",
+  "path": "src/jv.c"
+}
+```
+
+Node ID format: `<rel/path/to/file.c>` (POSIX separators, relative to repo root).
+
+*Function node* — represents a C function definition:
+
+```json
+"src/jv.c::jv_copy": {
+  "id":         "src/jv.c::jv_copy",
+  "kind":       "function",
+  "path":       "src/jv.c",
+  "name":       "jv_copy",
+  "start_line": 42,
+  "end_line":   58
+}
+```
+
+Node ID format: `<path>::<name>`. If two functions in the same file share a name, the second gets a `@<start_line>` suffix: `<path>::<name>@<start_line>`.
+
+**Edge schema:**
+
+```json
+{
+  "source":     "<node_id>",
+  "target":     "<node_id>",
+  "kind":       "call",
+  "weight":     1.0,
+  "confidence": 0.95
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `source` | string | Node ID of the source |
+| `target` | string | Node ID of the target |
+| `kind` | string | Edge type (see below) |
+| `weight` | float | Always `1.0` (reserved) |
+| `confidence` | float | Resolution confidence in `[0.0, 1.0]` |
+
+**Edge types and confidence values:**
+
+| `kind` | Source | Target | What It Captures | Confidence |
+|---|---|---|---|---|
+| `include` | file | file | File A `#include`s File B (local includes only) | `1.0` |
+| `call` | function | function | Function F calls Function G (unique resolution) | `0.95` |
+| `call` | function | function | Function F calls G (ambiguous, N candidates) | `0.95/N` |
+| `type_use` | file | file | File A references a struct defined in File B | `0.7` |
+| `test` | file | file | Test file T exercises source file S | `0.8` |
+
+**Builder notes:**
+- Skipped directories: `vendor`, `deps`, `contrib`, `third_party`, `third-party`, `external`, `node_modules`, `.git`, `build`, `cmake-build`
+- System headers (`<stdio.h>` etc.) are excluded; only quoted `#include "..."` directives produce edges
+- Test file detection: path matches `tests?/`, `test_`, or `_test.c` (case-insensitive)
+- `type_use` edges are file-level (not function-level), as struct resolution operates at the translation-unit level
+- The adjacency indexes (`adj`, `rev`) are derived from `edges` at load time and are not stored in JSON
 
 #### Test Results
 
@@ -98,6 +168,11 @@ Run tests with:
 python scripts/test_graph.py
 ```
 
+Run per-repo sanity-check stats with:
+```bash
+python scripts/stats_per_repo.py
+```
+
 ## Project Structure
 
 ```
@@ -112,6 +187,7 @@ swe-bench-agent/
   scripts/
     build_all_graphs.py  # Build graphs for all 179 SWE-bench-C instances
     test_graph.py        # Smoke tests (45 checks)
+    stats_per_repo.py    # Per-repo sanity-check stats
   graphs/                # Serialized JSON graphs (gitignored)
   repos/                 # Cloned repositories (gitignored)
 ```
