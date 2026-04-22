@@ -174,86 +174,34 @@ When `apply_failed` is routed back, `localize_with_feedback()`:
 
 ---
 
-### 🔲 Person 4 — Diagnostician + Patcher (NOT STARTED)
+### ✅ Person 4 — Diagnostician + Patcher (COMPLETE)
 
 > **Owner**: Person 4
-> **Interface defined in**: `pipeline/schema.py`, `agents/stubs.py`
-> **Stub**: `agents/stubs.py` → `DiagnosticianStub`, `PatcherStub`
+> **Tests**: `scripts/test_person4.py`
 
-**Required files to implement**:
+Both agents use the `google-genai` SDK. By default they authenticate with
+`GEMINI_API_KEY` (matching the Planner); if `VERTEXAI_PROJECT` is set they
+transparently switch to Vertex AI.
 
-```
-agents/
-  diagnostician.py    ← DiagnosticianAgent
-  patcher.py          ← PatcherAgent
-```
-
-**Method signatures to implement** (from `agents/stubs.py`):
-
-```python
-class DiagnosticianAgent:
-    def diagnose(self, instance: SWEInstance, bundle: ContextBundle) -> FixPlan:
-        """Read ContextBundle, identify root cause, return FixPlan."""
-
-    def revise(self, instance: SWEInstance, bundle: ContextBundle,
-               feedback: FeedbackMessage) -> FixPlan:
-        """Revise FixPlan given test_failed or regression feedback."""
-
-class PatcherAgent:
-    def patch(self, instance: SWEInstance, fix_plan: FixPlan,
-              bundle: ContextBundle) -> PatchOutput:
-        """Generate a unified diff patch from the FixPlan."""
-
-    def patch_with_feedback(self, instance: SWEInstance, fix_plan: FixPlan,
-                            bundle: ContextBundle,
-                            feedback: FeedbackMessage) -> PatchOutput:
-        """Retry patch with compile error evidence appended."""
-```
-
-**Key constraints**:
-- `PatchOutput.unified_diff` must be a valid `git apply`-compatible unified diff
-- Context lines in the diff must come from actual file content (use `ContextBundle.file_contents`)
-- The Diagnostician's `FixPlan.affected_regions` should use real line numbers from `ContextBundle.relevant_snippets`
+| File | Role |
+|---|---|
+| `agents/diagnostician.py` | `DiagnosticianAgent.diagnose` / `.revise` — produces `FixPlan` with root cause, affected regions, and test constraints. |
+| `agents/patcher.py` | `PatcherAgent.patch` / `.patch_with_feedback` — emits a `git apply`-compatible unified diff. Context lines are copied from real file content in `ContextBundle.file_contents` (falls back to disk via `repo_root`). |
 
 ---
 
-### 🔲 Person 5 — Validator (NOT STARTED)
+### ✅ Person 5 — Validator (COMPLETE)
 
 > **Owner**: Person 5
-> **Interface defined in**: `pipeline/schema.py`, `agents/stubs.py`
-> **Stub**: `agents/stubs.py` → `ValidatorStub`
+> **Tests**: `scripts/test_person5.py`
 
-**Required file to implement**:
+| File | Role |
+|---|---|
+| `agents/validator.py` | `ValidatorAgent.validate` — runs `git apply` → `make` → FAIL_TO_PASS tests → PASS_TO_PASS regression check. Stops at first failure and returns the appropriate `FailureType` (`APPLY` / `COMPILE` / `TEST` / `REGRESSION`) so the controller can route evidence back to the responsible agent. |
 
-```
-agents/
-  validator.py    ← ValidatorAgent
-```
-
-**Method signature to implement**:
-
-```python
-class ValidatorAgent:
-    def validate(self, instance: SWEInstance, patch: PatchOutput) -> ValidationResult:
-        """
-        Run the three-stage validation:
-          Stage 1: git apply PatchOutput.unified_diff
-          Stage 2: compile the repository (make / cmake)
-          Stage 3: run fail_to_pass and pass_to_pass tests
-
-        Return ValidationResult with the correct FailureType:
-          apply_failed   → git apply rejected the diff
-          compile_failed → compilation error
-          test_failed    → FAIL_TO_PASS tests did not pass
-          regression     → PASS_TO_PASS tests broke
-          success        → all checks passed
-        """
-```
-
-**Key constraints**:
-- Must work on the SWE-bench-C Docker sandbox (or equivalent sandboxed environment)
-- `error_output` field must contain raw stdout/stderr (Diagnostician and Patcher use it for retry reasoning)
-- `tests_passed` / `tests_failed` lists should contain the exact test IDs from `instance.fail_to_pass` and `instance.pass_to_pass`
+`repo_root` is set per-instance by `run_pipeline.py` via
+`ValidatorAgent.set_repo_root(...)`. Compile / test timeouts are driven by
+`COMPILE_TIMEOUT` and `TEST_TIMEOUT` env vars (see `config.py`).
 
 ---
 
@@ -264,10 +212,8 @@ class ValidatorAgent:
 | `scripts/test_graph.py` | 45 | ✅ All passing |
 | `scripts/test_person2.py` | 38 | ✅ All passing (live LLM: SKIP — quota, key is valid) |
 | `scripts/test_person3.py` | 50 | ✅ All passing (real-repo: SKIP — repos/ not cloned yet) |
-| `scripts/test_person4.py` | — | 🔲 Not yet written |
-| `scripts/test_person5.py` | — | 🔲 Not yet written |
-
-**Total: 133/133 implemented tests passing.**
+| `scripts/test_person4.py` | Diagnostician + Patcher | ✅ integration tests written |
+| `scripts/test_person5.py` | Validator | ✅ integration tests written |
 
 ---
 
@@ -319,7 +265,7 @@ python run_pipeline.py --instance_id jq-493__jqlang__jq --stub-agents
 # Planner only (useful for testing Planner + Localizer together):
 python run_pipeline.py --instance_id jq-493__jqlang__jq --planner-only
 
-# Full pipeline (once Person 4 & 5 are implemented):
+# Full pipeline:
 python run_pipeline.py --instance_id jq-493__jqlang__jq
 
 # Run all jq instances:
@@ -359,10 +305,10 @@ swe-bench-agent/
 │   ├── __init__.py
 │   ├── planner.py               # ✅ Person 2 — Gemini LLM Planner
 │   ├── localizer.py             # ✅ Person 3 — Three-pass retrieval engine
-│   ├── stubs.py                 # Stubs for Person 4 & 5 (for testing)
-│   ├── diagnostician.py         # 🔲 Person 4 — TODO
-│   ├── patcher.py               # 🔲 Person 4 — TODO
-│   ├── validator.py             # 🔲 Person 5 — TODO
+│   ├── stubs.py                 # Stubs for smoke-testing (run_pipeline.py --stub-agents)
+│   ├── diagnostician.py         # ✅ Person 4 — DiagnosticianAgent
+│   ├── patcher.py               # ✅ Person 4 — PatcherAgent
+│   ├── validator.py             # ✅ Person 5 — ValidatorAgent
 │   └── tools/                   # ✅ Person 3 — Retrieval tools
 │       ├── __init__.py
 │       ├── grep_tool.py         # Regex grep over repo source files

@@ -253,37 +253,45 @@ class PatcherAgent:
         patch_with_feedback(instance, fix_plan, bundle, fb) → PatchOutput
 
     Args:
-        model_name: Model identifier to use with Vertex AI.
+        model_name: Gemini model identifier.
+        api_key:    Gemini API key. If None, falls back to GEMINI_API_KEY /
+                    GOOGLE_API_KEY env vars (matches the Planner).
         repo_root:  Optional override for where to read files from disk.
                     In normal use the bundle already contains file_contents.
+                    The controller may reset this per-instance via
+                    `agent.set_repo_root(...)`.
 
     Environment variables:
-        VERTEXAI_PROJECT:  GCP project ID (required)
-        VERTEXAI_LOCATION: GCP location (default: us-central1)
-        MODEL_NAME:        Model to use (default: gemini-1.5-flash-002)
+        GEMINI_API_KEY:    Gemini API key (preferred)
+        GOOGLE_API_KEY:    Fallback key read by the google-genai SDK
+        MODEL_NAME:        Model to use (default: gemini-2.5-flash)
+        VERTEXAI_PROJECT:  Optional — if set, uses Vertex AI instead of the
+                           simple API-key path. VERTEXAI_LOCATION defaults
+                           to us-central1.
     """
 
     def __init__(
         self,
         model_name: str | None = None,
+        api_key: str | None = None,
         repo_root: str = "",
     ) -> None:
-        # Use provided model name, or fall back to MODEL_NAME env var, or use default
         self._model = model_name or os.environ.get("MODEL_NAME", _DEFAULT_MODEL)
         self._repo_root = repo_root
 
-        # Initialize google-genai client with Vertex AI
         project = os.environ.get("VERTEXAI_PROJECT")
-        location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
+        if project:
+            location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
+            self._client = genai.Client(
+                vertexai=True, project=project, location=location,
+            )
+        else:
+            self._client = genai.Client(
+                api_key=api_key or os.environ.get("GEMINI_API_KEY")
+            )
 
-        if not project:
-            raise ValueError("VERTEXAI_PROJECT environment variable must be set")
-
-        self._client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location,
-        )
+    def set_repo_root(self, repo_root: str) -> None:
+        self._repo_root = repo_root
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

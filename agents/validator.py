@@ -41,8 +41,9 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-COMPILE_TIMEOUT = 120
-TEST_TIMEOUT = 60
+import os as _os
+COMPILE_TIMEOUT = int(_os.environ.get("COMPILE_TIMEOUT", "300"))
+TEST_TIMEOUT = int(_os.environ.get("TEST_TIMEOUT", "120"))
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -345,6 +346,9 @@ class ValidatorAgent:
     """
 
     def __init__(self, repo_root: Optional[str] = None) -> None:
+        self._repo_root = repo_root
+
+    def set_repo_root(self, repo_root: str) -> None:
         self._repo_root = repo_root
 
     def validate(

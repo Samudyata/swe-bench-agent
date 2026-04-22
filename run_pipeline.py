@@ -108,17 +108,17 @@ def build_agents(config: Config, stub_mode: bool):
 
     Returns a dict with keys: planner, localizer, diagnostician, patcher, validator.
     When stub_mode=True, stub agents are used for everything except the Planner.
+    Each agent configures its own google-genai client — we do not pre-configure
+    the SDK here.
     """
-    import google.generativeai as genai
-    if config.gemini_api_key:
-        genai.configure(api_key=config.gemini_api_key)
-
     from agents.planner import PlannerAgent
     from agents.stubs import DiagnosticianStub, LocalizerStub, PatcherStub, ValidatorStub
 
+    api_key = config.gemini_api_key or None
+
     planner = PlannerAgent(
         model_name=config.model_name,
-        api_key=config.gemini_api_key or None,
+        api_key=api_key,
     )
 
     if stub_mode:
@@ -131,34 +131,32 @@ def build_agents(config: Config, stub_mode: bool):
             validator=ValidatorStub(stub_mode=True),
         )
 
-    # Real agents — teammates must have implemented these
-    # Import lazily so the file works even if teammates haven't created their files yet
     try:
         from agents.localizer import LocalizerAgent
         localizer = LocalizerAgent()
     except ImportError:
-        log.warning("agents/localizer.py not found — using stub (Person 3 not yet implemented)")
-        localizer = LocalizerStub(stub_mode=False)   # will raise NotImplementedError
+        log.warning("agents/localizer.py not found — using stub")
+        localizer = LocalizerStub(stub_mode=False)
 
     try:
         from agents.diagnostician import DiagnosticianAgent
-        diagnostician = DiagnosticianAgent()
+        diagnostician = DiagnosticianAgent(api_key=api_key)
     except ImportError:
-        log.warning("agents/diagnostician.py not found — using stub (Person 4 not yet implemented)")
+        log.warning("agents/diagnostician.py not found — using stub")
         diagnostician = DiagnosticianStub(stub_mode=False)
 
     try:
         from agents.patcher import PatcherAgent
-        patcher = PatcherAgent()
+        patcher = PatcherAgent(api_key=api_key)
     except ImportError:
-        log.warning("agents/patcher.py not found — using stub (Person 4 not yet implemented)")
+        log.warning("agents/patcher.py not found — using stub")
         patcher = PatcherStub(stub_mode=False)
 
     try:
         from agents.validator import ValidatorAgent
         validator = ValidatorAgent()
     except ImportError:
-        log.warning("agents/validator.py not found — using stub (Person 5 not yet implemented)")
+        log.warning("agents/validator.py not found — using stub")
         validator = ValidatorStub(stub_mode=False)
 
     return dict(
@@ -168,6 +166,15 @@ def build_agents(config: Config, stub_mode: bool):
         patcher=patcher,
         validator=validator,
     )
+
+
+def _resolve_repo_root(config: Config, instance: SWEInstance) -> Path:
+    """Return the filesystem path where this instance's repo should live.
+
+    Layout: <repos_dir>/<owner>__<name>/
+    """
+    repo_slug = instance.repo.replace("/", "__")
+    return config.repos_dir / repo_slug
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +201,13 @@ def run_instance(
 
     graph = DepGraph.load(graph_path)
     log.info("[%s] Loaded graph: %s", instance_id, graph)
+
+    # Point Patcher + Validator at this instance's checked-out repo
+    repo_root = _resolve_repo_root(config, instance)
+    for slot in ("patcher", "validator"):
+        setter = getattr(agents.get(slot), "set_repo_root", None)
+        if callable(setter):
+            setter(str(repo_root))
 
     # ── Planner-only mode ─────────────────────────────────────────────────────
     if planner_only:

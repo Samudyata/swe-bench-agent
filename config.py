@@ -5,14 +5,19 @@ or by passing keyword arguments to Config().
 
 Environment variables
 ---------------------
-GEMINI_API_KEY      Required. Google Gemini API key.
+GEMINI_API_KEY      Required unless VERTEXAI_PROJECT is set. Google Gemini API key.
 MODEL_NAME          Gemini model (default: gemini-2.0-flash).
 CONF_THRESHOLD      Localizer confidence threshold (default: 0.4).
 MAX_RETRIES         Max retries per agent on failure (default: 2).
+COMPILE_TIMEOUT     Validator compile timeout in seconds (default: 300).
+TEST_TIMEOUT        Validator per-test timeout in seconds (default: 120).
 LOG_DIR             Directory for JSONL logs (default: logs/).
 GRAPHS_DIR          Directory with pre-built graph JSON files (default: graphs/).
 REPOS_DIR           Directory with cloned repositories (default: repos/).
 RESULTS_DIR         Directory for result JSON outputs (default: results/).
+VERTEXAI_PROJECT    Optional. If set, Diagnostician/Patcher use Vertex AI
+                    instead of the GEMINI_API_KEY path.
+VERTEXAI_LOCATION   Vertex AI location (default: us-central1).
 
 Example .env file
 -----------------
@@ -40,6 +45,8 @@ class Config:
     # Pipeline behaviour
     confidence_threshold: float = 0.4   # below this → route LOW_CONF to Planner
     max_retries: int = 2                 # max retries per agent slot
+    compile_timeout: int = 300           # validator: seconds for `make`
+    test_timeout: int = 120              # validator: seconds per test run
 
     # Filesystem paths
     log_dir: Path = field(default_factory=lambda: Path("logs"))
@@ -59,10 +66,11 @@ class Config:
         """Build Config from environment variables (+ optional .env file)."""
         _load_dotenv()
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key:
+        if not api_key and not os.environ.get("VERTEXAI_PROJECT"):
             import warnings
             warnings.warn(
-                "GEMINI_API_KEY is not set. Planner LLM calls will fail.",
+                "Neither GEMINI_API_KEY nor VERTEXAI_PROJECT is set. "
+                "LLM calls will fail.",
                 stacklevel=2,
             )
         return cls(
@@ -70,6 +78,8 @@ class Config:
             model_name=os.getenv("MODEL_NAME", "gemini-2.0-flash"),
             confidence_threshold=float(os.getenv("CONF_THRESHOLD", "0.4")),
             max_retries=int(os.getenv("MAX_RETRIES", "2")),
+            compile_timeout=int(os.getenv("COMPILE_TIMEOUT", "300")),
+            test_timeout=int(os.getenv("TEST_TIMEOUT", "120")),
             log_dir=Path(os.getenv("LOG_DIR", "logs")),
             graphs_dir=Path(os.getenv("GRAPHS_DIR", "graphs")),
             repos_dir=Path(os.getenv("REPOS_DIR", "repos")),
@@ -77,8 +87,8 @@ class Config:
         )
 
     def ensure_dirs(self) -> None:
-        """Create output directories if they don't exist."""
-        for d in (self.log_dir, self.results_dir):
+        """Create all output/working directories if they don't exist."""
+        for d in (self.log_dir, self.results_dir, self.graphs_dir, self.repos_dir):
             d.mkdir(parents=True, exist_ok=True)
 
 
