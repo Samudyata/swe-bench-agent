@@ -132,9 +132,8 @@ def _make_bundle() -> ContextBundle:
 def test_full_pipeline() -> None:
     print("\n=== Full Pipeline: Diagnostician → Patcher → Validator ===")
 
-    api_key = os.environ.get("VERTEXAI_PROJECT", "")
-    if not api_key:
-        print("  SKIP  VERTEXAI_PROJECT not set — skipping live pipeline test")
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("VERTEXAI_PROJECT")):
+        print("  SKIP  no GEMINI_API_KEY / VERTEXAI_PROJECT — skipping live pipeline test")
         return
 
     # Check if jq repo exists
