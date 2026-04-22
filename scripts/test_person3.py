@@ -23,7 +23,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load .env so GEMINI_API_KEY is available
+# Load .env so OPENAI_API_KEY is available
 try:
     from dotenv import load_dotenv
     for _c in [PROJECT_ROOT / ".env", PROJECT_ROOT.parent / ".env"]:

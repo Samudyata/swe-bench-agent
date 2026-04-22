@@ -108,10 +108,12 @@ class LocalizerAgent:
         max_funcs_per_file: Max function snippets extracted per file.
         auto_checkout:      If True, call ``ensure_repo_at_commit`` when the
                             repo directory does not exist (requires git on PATH).
-        use_llm_rerank:     If True, use Gemini to re-rank the top candidates.
+        use_llm_rerank:     If True, call Voyager to re-rank the top candidates.
                             Off by default for the baseline ablation.
-        model_name:         Gemini model used for optional LLM re-ranking.
-        api_key:            Gemini API key; falls back to GEMINI_API_KEY env var.
+        model_name:         Model used for optional LLM re-ranking
+                            (default: qwen3-30b-a3b-instruct-2507).
+        api_key:            Voyager API key; falls back to OPENAI_API_KEY env.
+        base_url:           Voyager base URL; falls back to OPENAI_API_BASE env.
     """
 
     def __init__(
@@ -121,8 +123,9 @@ class LocalizerAgent:
         max_funcs_per_file: int = MAX_FUNCS_PER_FILE,
         auto_checkout: bool = True,
         use_llm_rerank: bool = False,
-        model_name: str = "gemini-1.5-flash",
+        model_name: str | None = None,
         api_key: str | None = None,
+        base_url: str | None = None,
     ) -> None:
         self.repos_dir = Path(repos_dir)
         self.max_candidates = max_candidates
@@ -131,6 +134,7 @@ class LocalizerAgent:
         self.use_llm_rerank = use_llm_rerank
         self._model_name = model_name
         self._api_key = api_key
+        self._base_url = base_url
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -512,23 +516,21 @@ class LocalizerAgent:
         candidates: list[LocalizerCandidate],
         instance: SWEInstance,
     ) -> list[LocalizerCandidate]:
-        """Re-rank candidates using a lightweight Gemini flash call.
+        """Re-rank candidates using a Voyager / Qwen3-30B call.
 
         Enabled when ``use_llm_rerank=True`` (for V6+ ablation).
-        Sends: issue text + top candidate file paths.
-        Receives: ranked list of file paths.
         Falls back to original order on any error.
         """
         try:
-            from google import genai
-            from google.genai import types as genai_types
+            import json as _json
+            from agents.llm import DEFAULT_MODEL, chat, make_client
 
-            client = genai.Client(api_key=self._api_key)
+            client = make_client(api_key=self._api_key, base_url=self._base_url)
             file_list = "\n".join(
                 f"{i+1}. {c.file_path}  (score={c.score:.3f}, {c.reason})"
                 for i, c in enumerate(candidates)
             )
-            prompt = (
+            user = (
                 f"Repository: {instance.instance_id}\n\n"
                 f"Bug report:\n{instance.problem_statement[:800]}\n\n"
                 f"Candidate files for the bug:\n{file_list}\n\n"
@@ -536,18 +538,26 @@ class LocalizerAgent:
                 "Return ONLY a JSON array of file paths in ranked order. "
                 "Example: [\"src/jv.c\", \"src/execute.c\"]"
             )
-            response = client.models.generate_content(
-                model=self._model_name,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                ),
-            )
-            import json
-            ranked_paths: list[str] = json.loads(response.text.strip())
+            text = chat(
+                client=client,
+                model=self._model_name or DEFAULT_MODEL,
+                system="You rank candidate source files for a bug localisation task. Output JSON only.",
+                user=user,
+                temperature=0.0,
+                max_tokens=512,
+                max_retries=1,
+                agent_name="Localizer.rerank",
+            ).strip()
+            if text.startswith("```"):
+                text = "\n".join(
+                    ln for ln in text.splitlines() if not ln.startswith("```")
+                ).strip()
+            start = text.find("[")
+            end = text.rfind("]") + 1
+            if start == -1 or end == 0:
+                raise ValueError("no JSON array in re-rank response")
+            ranked_paths: list[str] = _json.loads(text[start:end])
 
-            # Rebuild candidate list in new order, preserve any not in response
             path_to_cand = {c.file_path: c for c in candidates}
             reranked = [path_to_cand[p] for p in ranked_paths if p in path_to_cand]
             seen_paths = set(ranked_paths)

@@ -1,12 +1,13 @@
 """Environment-driven configuration for the swe-bench-agent pipeline.
 
-All settings have sensible defaults.  Override via environment variables
+All settings have sensible defaults. Override via environment variables
 or by passing keyword arguments to Config().
 
 Environment variables
 ---------------------
-GEMINI_API_KEY      Required unless VERTEXAI_PROJECT is set. Google Gemini API key.
-MODEL_NAME          Gemini model (default: gemini-2.0-flash).
+OPENAI_API_KEY      Required. Voyager API key.
+OPENAI_API_BASE     Voyager base URL (default: https://openai.rc.asu.edu/v1).
+MODEL_NAME          Model to use (default: qwen3-30b-a3b-instruct-2507).
 CONF_THRESHOLD      Localizer confidence threshold (default: 0.4).
 MAX_RETRIES         Max retries per agent on failure (default: 2).
 COMPILE_TIMEOUT     Validator compile timeout in seconds (default: 300).
@@ -15,14 +16,12 @@ LOG_DIR             Directory for JSONL logs (default: logs/).
 GRAPHS_DIR          Directory with pre-built graph JSON files (default: graphs/).
 REPOS_DIR           Directory with cloned repositories (default: repos/).
 RESULTS_DIR         Directory for result JSON outputs (default: results/).
-VERTEXAI_PROJECT    Optional. If set, Diagnostician/Patcher use Vertex AI
-                    instead of the GEMINI_API_KEY path.
-VERTEXAI_LOCATION   Vertex AI location (default: us-central1).
 
 Example .env file
 -----------------
-    GEMINI_API_KEY=your-key-here
-    MODEL_NAME=gemini-2.0-flash
+    OPENAI_API_KEY=your-voyager-key
+    OPENAI_API_BASE=https://openai.rc.asu.edu/v1
+    MODEL_NAME=qwen3-30b-a3b-instruct-2507
     CONF_THRESHOLD=0.4
     MAX_RETRIES=2
 """
@@ -33,14 +32,18 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+DEFAULT_MODEL = "qwen3-30b-a3b-instruct-2507"
+DEFAULT_BASE_URL = "https://openai.rc.asu.edu/v1"
+
 
 @dataclass
 class Config:
     """Pipeline configuration with environment-variable overrides."""
 
     # LLM settings
-    model_name: str = "gemini-2.0-flash"
-    gemini_api_key: str = ""
+    model_name: str = DEFAULT_MODEL
+    openai_api_key: str = ""
+    openai_api_base: str = DEFAULT_BASE_URL
 
     # Pipeline behaviour
     confidence_threshold: float = 0.4   # below this → route LOW_CONF to Planner
@@ -55,7 +58,6 @@ class Config:
     results_dir: Path = field(default_factory=lambda: Path("results"))
 
     def __post_init__(self) -> None:
-        # Ensure Path objects
         self.log_dir = Path(self.log_dir)
         self.graphs_dir = Path(self.graphs_dir)
         self.repos_dir = Path(self.repos_dir)
@@ -65,17 +67,17 @@ class Config:
     def from_env(cls) -> Config:
         """Build Config from environment variables (+ optional .env file)."""
         _load_dotenv()
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        if not api_key and not os.environ.get("VERTEXAI_PROJECT"):
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
             import warnings
             warnings.warn(
-                "Neither GEMINI_API_KEY nor VERTEXAI_PROJECT is set. "
-                "LLM calls will fail.",
+                "OPENAI_API_KEY is not set. LLM calls will fail.",
                 stacklevel=2,
             )
         return cls(
-            gemini_api_key=api_key,
-            model_name=os.getenv("MODEL_NAME", "gemini-2.0-flash"),
+            openai_api_key=api_key,
+            openai_api_base=os.getenv("OPENAI_API_BASE", DEFAULT_BASE_URL),
+            model_name=os.getenv("MODEL_NAME", DEFAULT_MODEL),
             confidence_threshold=float(os.getenv("CONF_THRESHOLD", "0.4")),
             max_retries=int(os.getenv("MAX_RETRIES", "2")),
             compile_timeout=int(os.getenv("COMPILE_TIMEOUT", "300")),
@@ -96,7 +98,6 @@ def _load_dotenv() -> None:
     """Load .env file if python-dotenv is available (optional dependency)."""
     try:
         from dotenv import load_dotenv
-        # Walk up from CWD to find a .env file
         cwd = Path.cwd()
         for parent in [cwd] + list(cwd.parents):
             env_file = parent / ".env"
@@ -104,4 +105,4 @@ def _load_dotenv() -> None:
                 load_dotenv(env_file)
                 break
     except ImportError:
-        pass   # dotenv not installed — rely purely on os.environ
+        pass

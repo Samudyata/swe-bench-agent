@@ -25,13 +25,11 @@ import logging
 import os
 import re
 import textwrap
-import time
 from pathlib import Path
 from typing import Any
 
-from google import genai
-from google.genai import types as genai_types
-
+from agents.llm import DEFAULT_MODEL as _DEFAULT_MODEL
+from agents.llm import chat, make_client
 from pipeline.schema import (
     ContextBundle,
     FeedbackMessage,
@@ -44,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-_DEFAULT_MODEL = "gemini-2.5-flash"
 _MAX_TOKENS       = 4096
 _MAX_RETRIES      = 2
 
@@ -218,29 +215,16 @@ def _call_llm(
     system: str,
     user: str,
 ) -> str:
-    """Call the LLM and return the raw text response, retrying on failure."""
-    last_exc: Exception | None = None
-    for attempt in range(1, _MAX_RETRIES + 2):
-        if attempt > 1:
-            wait = 2 ** attempt
-            logger.warning("Patcher LLM retry %d after %ds", attempt, wait)
-            time.sleep(wait)
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=f"{system}\n\n{user}",
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=_MAX_TOKENS,
-                ),
-            )
-            return response.text or ""
-        except Exception as exc:
-            logger.error("Patcher LLM call failed (attempt %d): %s", attempt, exc)
-            last_exc = exc
-    raise RuntimeError(
-        f"Patcher failed after {_MAX_RETRIES + 1} attempts"
-    ) from last_exc
+    return chat(
+        client=client,
+        model=model,
+        system=system,
+        user=user,
+        temperature=0.2,
+        max_tokens=_MAX_TOKENS,
+        max_retries=_MAX_RETRIES,
+        agent_name="Patcher",
+    )
 
 
 # ── Public agent class ────────────────────────────────────────────────────────
@@ -253,42 +237,31 @@ class PatcherAgent:
         patch_with_feedback(instance, fix_plan, bundle, fb) → PatchOutput
 
     Args:
-        model_name: Gemini model identifier.
-        api_key:    Gemini API key. If None, falls back to GEMINI_API_KEY /
-                    GOOGLE_API_KEY env vars (matches the Planner).
+        model_name: OpenAI-compatible model identifier
+                    (default: qwen3-30b-a3b-instruct-2507).
+        api_key:    Voyager API key. If None, reads OPENAI_API_KEY env.
+        base_url:   Voyager base URL. If None, reads OPENAI_API_BASE env.
         repo_root:  Optional override for where to read files from disk.
                     In normal use the bundle already contains file_contents.
                     The controller may reset this per-instance via
                     `agent.set_repo_root(...)`.
 
     Environment variables:
-        GEMINI_API_KEY:    Gemini API key (preferred)
-        GOOGLE_API_KEY:    Fallback key read by the google-genai SDK
-        MODEL_NAME:        Model to use (default: gemini-2.5-flash)
-        VERTEXAI_PROJECT:  Optional — if set, uses Vertex AI instead of the
-                           simple API-key path. VERTEXAI_LOCATION defaults
-                           to us-central1.
+        OPENAI_API_KEY:  Voyager API key
+        OPENAI_API_BASE: Voyager base URL (default: https://openai.rc.asu.edu/v1)
+        MODEL_NAME:      Model to use (default: qwen3-30b-a3b-instruct-2507)
     """
 
     def __init__(
         self,
         model_name: str | None = None,
         api_key: str | None = None,
+        base_url: str | None = None,
         repo_root: str = "",
     ) -> None:
         self._model = model_name or os.environ.get("MODEL_NAME", _DEFAULT_MODEL)
         self._repo_root = repo_root
-
-        project = os.environ.get("VERTEXAI_PROJECT")
-        if project:
-            location = os.environ.get("VERTEXAI_LOCATION", "us-central1")
-            self._client = genai.Client(
-                vertexai=True, project=project, location=location,
-            )
-        else:
-            self._client = genai.Client(
-                api_key=api_key or os.environ.get("GEMINI_API_KEY")
-            )
+        self._client = make_client(api_key=api_key, base_url=base_url)
 
     def set_repo_root(self, repo_root: str) -> None:
         self._repo_root = repo_root

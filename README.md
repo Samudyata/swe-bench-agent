@@ -96,11 +96,11 @@ All typed messages that flow between agents — **the source of truth for Person
 - `PipelineLogger.load(path)` — static method to replay a run's events
 
 #### Planner Agent (`agents/planner.py`)
-- **LLM backend**: Google Gemini (via `google-genai` SDK)
+- **LLM backend**: Voyager (OpenAI-compatible) running `qwen3-30b-a3b-instruct-2507`
 - Produces `PlannerOutput` with keywords, priority functions, suspected modules
 - **Two prompts**: initial plan (`plan()`) and low-confidence replan (`replan()`)
-- JSON output mode with parse-failure retry (up to `max_llm_retries`)
-- Migrated to `google.genai` client (not deprecated `google.generativeai`)
+- JSON output with brace-extraction + parse-failure retry (up to `max_llm_retries`)
+- Shared OpenAI client defined in `agents/llm.py`; Diagnostician and Patcher reuse it
 
 #### Pipeline Controller (`pipeline/controller.py`)
 - Sequences all 5 agents: Planner → Localizer → Diagnostician → Patcher → Validator
@@ -179,9 +179,9 @@ When `apply_failed` is routed back, `localize_with_feedback()`:
 > **Owner**: Person 4
 > **Tests**: `scripts/test_person4.py`
 
-Both agents use the `google-genai` SDK. By default they authenticate with
-`GEMINI_API_KEY` (matching the Planner); if `VERTEXAI_PROJECT` is set they
-transparently switch to Vertex AI.
+Both agents use the shared Voyager / Qwen3-30B client in `agents/llm.py`
+(OpenAI-compatible). Credentials come from `OPENAI_API_KEY` and
+`OPENAI_API_BASE` (default `https://openai.rc.asu.edu/v1`).
 
 | File | Role |
 |---|---|
@@ -222,7 +222,7 @@ transparently switch to Vertex AI.
 ### 1. Install dependencies
 
 ```bash
-pip install tree-sitter tree-sitter-c google-genai python-dotenv
+pip install tree-sitter tree-sitter-c openai python-dotenv
 # Optional for HuggingFace dataset auto-download:
 pip install datasets
 ```
@@ -231,7 +231,7 @@ pip install datasets
 
 ```bash
 cp .env.example .env
-# Edit .env and add your GEMINI_API_KEY
+# Edit .env and add your OPENAI_API_KEY (Voyager key)
 ```
 
 ### 3. Build graphs (Person 1 prerequisite)
@@ -252,7 +252,7 @@ python scripts/build_all_graphs.py
 python scripts/test_graph.py
 python -X utf8 scripts/test_person3.py
 
-# Needs GEMINI_API_KEY set in .env:
+# Needs OPENAI_API_KEY set in .env:
 python -X utf8 scripts/test_person2.py
 ```
 
@@ -303,7 +303,8 @@ swe-bench-agent/
 │
 ├── agents/                      # Agents
 │   ├── __init__.py
-│   ├── planner.py               # ✅ Person 2 — Gemini LLM Planner
+│   ├── planner.py               # ✅ Person 2 — Voyager/Qwen3-30B Planner
+│   ├── llm.py                   # Shared OpenAI-compatible client (Voyager)
 │   ├── localizer.py             # ✅ Person 3 — Three-pass retrieval engine
 │   ├── stubs.py                 # Stubs for smoke-testing (run_pipeline.py --stub-agents)
 │   ├── diagnostician.py         # ✅ Person 4 — DiagnosticianAgent
@@ -375,10 +376,13 @@ python run_pipeline.py --instance_id jq-493__jqlang__jq --stub-agents
 
 | Variable | Default | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | *required* | Google Gemini API key ([get one here](https://aistudio.google.com/apikey)) |
-| `MODEL_NAME` | `gemini-1.5-flash` | Gemini model for Planner (and optional Localizer re-ranking) |
+| `OPENAI_API_KEY` | *required* | Voyager API key (ASU) |
+| `OPENAI_API_BASE` | `https://openai.rc.asu.edu/v1` | Voyager base URL |
+| `MODEL_NAME` | `qwen3-30b-a3b-instruct-2507` | Model for Planner / Diagnostician / Patcher |
 | `CONF_THRESHOLD` | `0.4` | Localizer confidence below this → replan |
 | `MAX_RETRIES` | `2` | Max retries per agent slot on failure |
+| `COMPILE_TIMEOUT` | `300` | Validator: `make` timeout (seconds) |
+| `TEST_TIMEOUT` | `120` | Validator: per-test timeout (seconds) |
 | `LOG_DIR` | `logs/` | JSONL log output directory |
 | `GRAPHS_DIR` | `graphs/` | Pre-built graph JSON files |
 | `REPOS_DIR` | `repos/` | Cloned repository checkouts |

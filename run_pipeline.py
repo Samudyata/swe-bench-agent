@@ -108,18 +108,18 @@ def build_agents(config: Config, stub_mode: bool):
 
     Returns a dict with keys: planner, localizer, diagnostician, patcher, validator.
     When stub_mode=True, stub agents are used for everything except the Planner.
-    Each agent configures its own google-genai client — we do not pre-configure
-    the SDK here.
+    All three LLM-backed agents (Planner, Diagnostician, Patcher) talk to
+    Voyager (OpenAI-compatible) via agents/llm.py.
     """
     from agents.planner import PlannerAgent
     from agents.stubs import DiagnosticianStub, LocalizerStub, PatcherStub, ValidatorStub
 
-    api_key = config.gemini_api_key or None
-
-    planner = PlannerAgent(
-        model_name=config.model_name,
-        api_key=api_key,
+    llm_kwargs = dict(
+        api_key=config.openai_api_key or None,
+        base_url=config.openai_api_base or None,
     )
+
+    planner = PlannerAgent(model_name=config.model_name, **llm_kwargs)
 
     if stub_mode:
         log.warning("Running with STUB agents for Person 3/4/5 — results are not meaningful")
@@ -140,14 +140,14 @@ def build_agents(config: Config, stub_mode: bool):
 
     try:
         from agents.diagnostician import DiagnosticianAgent
-        diagnostician = DiagnosticianAgent(api_key=api_key)
+        diagnostician = DiagnosticianAgent(model_name=config.model_name, **llm_kwargs)
     except ImportError:
         log.warning("agents/diagnostician.py not found — using stub")
         diagnostician = DiagnosticianStub(stub_mode=False)
 
     try:
         from agents.patcher import PatcherAgent
-        patcher = PatcherAgent(api_key=api_key)
+        patcher = PatcherAgent(model_name=config.model_name, **llm_kwargs)
     except ImportError:
         log.warning("agents/patcher.py not found — using stub")
         patcher = PatcherStub(stub_mode=False)
@@ -302,7 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="Override the Gemini model name (e.g. gemini-1.5-pro)",
+        help="Override the model name (e.g. qwen3-30b-a3b-instruct-2507)",
     )
     parser.add_argument(
         "--max-retries",

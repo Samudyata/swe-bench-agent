@@ -1,14 +1,11 @@
 """Planner agent — converts a GitHub issue into a structured search plan.
 
-Migrated to the current Google GenAI SDK (google-genai package).
-Install with: pip install google-genai
+LLM backend: Voyager (OpenAI-compatible) running qwen3-30b-a3b-instruct-2507.
+Install with: pip install openai
 
 The Planner is a pure LLM reasoning agent: it receives the raw issue text
 and produces a PlannerOutput containing keywords, search hints, and suspected
-modules.  It does NOT call any tools or read the repository.
-
-LLM backend: Google Gemini (gemini-2.0-flash by default).
-JSON output mode is enabled via response_mime_type so parsing is reliable.
+modules. It does NOT call any tools or read the repository.
 
 Usage
 -----
@@ -26,12 +23,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import Any
 
-from google import genai
-from google.genai import types as genai_types
-
+from agents.llm import DEFAULT_MODEL, chat, make_client
 from pipeline.schema import FeedbackMessage, PlannerOutput, SWEInstance
 
 logger = logging.getLogger(__name__)
@@ -129,27 +123,28 @@ Return ONLY valid JSON.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PlannerAgent:
-    """LLM-backed Planner agent.
+    """LLM-backed Planner agent (Voyager / Qwen3-30B).
 
     Args:
-        model_name:    Gemini model identifier.
-        api_key:       Gemini API key.  If None, reads from GOOGLE_API_KEY env.
-        max_llm_retries: Number of times to retry the LLM call on parse failure.
-        temperature:   Sampling temperature (0.0 = deterministic).
+        model_name:      OpenAI-compatible model identifier.
+        api_key:         Voyager API key. If None, reads OPENAI_API_KEY env.
+        base_url:        Voyager base URL. If None, reads OPENAI_API_BASE env.
+        max_llm_retries: Retries on API or JSON-parse failure.
+        temperature:     Sampling temperature (0.0 = deterministic).
     """
 
     def __init__(
         self,
-        model_name: str = "gemini-2.0-flash",
+        model_name: str = DEFAULT_MODEL,
         api_key: str | None = None,
+        base_url: str | None = None,
         max_llm_retries: int = 2,
         temperature: float = 0.2,
     ) -> None:
         self._model_name = model_name
         self._max_llm_retries = max_llm_retries
         self._temperature = temperature
-        # Initialise the GenAI client; api_key=None falls back to GOOGLE_API_KEY env var
-        self._client = genai.Client(api_key=api_key)
+        self._client = make_client(api_key=api_key, base_url=base_url)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -226,34 +221,33 @@ class PlannerAgent:
     # ── LLM call + retry ──────────────────────────────────────────────────────
 
     def _call_with_retry(self, prompt: str) -> dict[str, Any]:
-        """Call the LLM and parse JSON, retrying on failure."""
+        """Call the LLM and parse JSON, retrying on transport or parse failure."""
         last_exc: Exception | None = None
 
-        full_prompt = f"{_SYSTEM_INSTRUCTION}\n\n{prompt}"
-
         for attempt in range(self._max_llm_retries + 1):
-            if attempt > 0:
-                backoff = 2 ** attempt
-                logger.warning("Planner LLM retry %d/%d after %ds",
-                               attempt, self._max_llm_retries, backoff)
-                time.sleep(backoff)
             try:
-                response = self._client.models.generate_content(
+                text = chat(
+                    client=self._client,
                     model=self._model_name,
-                    contents=full_prompt,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=self._temperature,
-                        response_mime_type="application/json",
-                    ),
-                )
-                text = response.text.strip()
-                # Strip markdown fences if model adds them despite instruction
+                    system=_SYSTEM_INSTRUCTION,
+                    user=prompt,
+                    temperature=self._temperature,
+                    max_tokens=2048,
+                    max_retries=0,              # retry is handled at this level
+                    agent_name="Planner",
+                ).strip()
+
                 if text.startswith("```"):
                     text = "\n".join(
                         line for line in text.splitlines()
                         if not line.startswith("```")
                     ).strip()
-                return json.loads(text)
+
+                start, end = text.find("{"), text.rfind("}") + 1
+                if start == -1 or end == 0:
+                    raise json.JSONDecodeError("no JSON object", text, 0)
+                return json.loads(text[start:end])
+
             except json.JSONDecodeError as exc:
                 logger.warning("Planner JSON parse failed (attempt %d): %s", attempt, exc)
                 last_exc = exc

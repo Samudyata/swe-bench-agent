@@ -8,7 +8,7 @@ Tests are split into sections:
   1. Schema round-trip  (no LLM needed)
   2. Logger             (no LLM needed)
   3. Controller + stubs (no LLM needed)
-  4. Planner (live LLM) (requires GEMINI_API_KEY)
+  4. Planner (live LLM) (requires OPENAI_API_KEY)
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load .env so GEMINI_API_KEY is available for live tests
+# Load .env so OPENAI_API_KEY is available for live tests
 try:
     from dotenv import load_dotenv
     for _candidate in [PROJECT_ROOT / ".env", PROJECT_ROOT.parent / ".env"]:
@@ -353,15 +353,15 @@ def test_controller_stubs() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Planner live test (requires GEMINI_API_KEY)
+# 4. Planner live test (requires OPENAI_API_KEY)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_planner_live() -> None:
     print("\n=== Planner (live LLM) ===")
 
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+    api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        print("  SKIP  GEMINI_API_KEY not set — skipping live Planner test")
+        print("  SKIP  OPENAI_API_KEY not set — skipping live Planner test")
         return
 
     from agents.planner import PlannerAgent

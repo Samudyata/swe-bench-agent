@@ -145,8 +145,8 @@ def _make_bundle() -> ContextBundle:
 def test_diagnostician() -> None:
     print("\n=== DiagnosticianAgent ===")
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("VERTEXAI_PROJECT")):
-        print("  SKIP  no GEMINI_API_KEY / VERTEXAI_PROJECT — skipping live Diagnostician test")
+    if not (os.environ.get("OPENAI_API_KEY")):
+        print("  SKIP  no OPENAI_API_KEY — skipping live Diagnostician test")
         return
 
     from agents.diagnostician import DiagnosticianAgent
@@ -184,8 +184,8 @@ def test_diagnostician() -> None:
 def test_patcher() -> None:
     print("\n=== PatcherAgent ===")
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("VERTEXAI_PROJECT")):
-        print("  SKIP  no GEMINI_API_KEY / VERTEXAI_PROJECT — skipping live Patcher test")
+    if not (os.environ.get("OPENAI_API_KEY")):
+        print("  SKIP  no OPENAI_API_KEY — skipping live Patcher test")
         return
 
     from agents.patcher import PatcherAgent
@@ -246,8 +246,8 @@ def test_patcher() -> None:
 def test_feedback_loops() -> None:
     print("\n=== Feedback loops ===")
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("VERTEXAI_PROJECT")):
-        print("  SKIP  no GEMINI_API_KEY / VERTEXAI_PROJECT — skipping live feedback test")
+    if not (os.environ.get("OPENAI_API_KEY")):
+        print("  SKIP  no OPENAI_API_KEY — skipping live feedback test")
         return
 
     from agents.diagnostician import DiagnosticianAgent
@@ -314,8 +314,8 @@ def test_pipeline_integration() -> None:
     from graph.model import DepGraph
     from pipeline.controller import PipelineController
 
-    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("VERTEXAI_PROJECT")):
-        print("  SKIP  no GEMINI_API_KEY / VERTEXAI_PROJECT — skipping pipeline integration test")
+    if not (os.environ.get("OPENAI_API_KEY")):
+        print("  SKIP  no OPENAI_API_KEY — skipping pipeline integration test")
         return
 
     # Build a minimal graph
