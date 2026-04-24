@@ -348,7 +348,7 @@ def test_pipeline_integration() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         config = Config(
-            gemini_api_key="",
+            openai_api_key="",
             log_dir=Path(tmp) / "logs",
             results_dir=Path(tmp) / "results",
             confidence_threshold=0.4,
